@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import cv2
 import multiprocessing
@@ -13,6 +14,14 @@ from video_output import finalize_output
 # Global variables for shared resources
 global_upsampler = None
 
+def cleanup_temp_dirs(temp_dir):
+    """Remove temporary directories and their contents"""
+    try:
+        if os.path.exists(temp_dir):
+            print(f"[🧹] Cleaning up temporary directory: {temp_dir}")
+            shutil.rmtree(temp_dir)
+    except Exception as e:
+        print(f"[⚠️] Warning: Failed to clean up {temp_dir}: {str(e)}")
 
 def init_worker():
     """Initialize worker process with proper resource limits"""
@@ -210,54 +219,71 @@ def enhance_frames(frame_dir, enhanced_dir, use_all_cores=True):
 
 
 def assemble_video(enhanced_dir, output_path, fps):
-    """Assemble enhanced frames into a video with thorough error checking"""
+    """
+    Assemble enhanced frames into a video (without audio) with thorough error checking.
+    The audio will be added later during finalize_output().
+    """
     # Verify enhanced_dir exists and contains frames
     if not os.path.exists(enhanced_dir):
         raise FileNotFoundError(f"Enhanced frames directory not found: {enhanced_dir}")
 
-    frame_files = sorted([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
-    if not frame_files:
-        raise ValueError(f"No PNG frames found in: {enhanced_dir}")
+    frame_files = sorted(
+        [f for f in os.listdir(enhanced_dir)
+         if f.lower().endswith('.png') and os.path.isfile(os.path.join(enhanced_dir, f))]
+    )
 
-    # Verify the first frame exists
+    if not frame_files:
+        raise ValueError(f"No valid PNG frames found in: {enhanced_dir}")
+
+    # Verify at least the first frame exists
     first_frame = os.path.join(enhanced_dir, frame_files[0])
     if not os.path.exists(first_frame):
         raise FileNotFoundError(f"First frame not found: {first_frame}")
 
-    # Prepare FFmpeg command
+    # Prepare FFmpeg command - explicitly no audio (-an)
     cmd = [
-        'ffmpeg', '-y', '-framerate', str(fps),
+        'ffmpeg', '-y',
+        '-framerate', str(fps),
         '-i', os.path.join(enhanced_dir, 'frame_%06d.png'),
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-an',  # Explicitly no audio
+        '-movflags', '+faststart',  # Enable faststart for web streaming
         output_path
     ]
 
     print(f"[🔁] Assembling {len(frame_files)} frames into video at {fps} FPS")
+    print(f"Command: {' '.join(cmd)}")
     print(f"Output will be saved to: {output_path}")
 
     try:
-        # Run FFmpeg with timeout (60 seconds)
-        subprocess.run(
+        # Run FFmpeg with error capture
+        result = subprocess.run(
             cmd,
             check=True,
-            timeout=60,
+            timeout=120,  # Increased timeout to 2 minutes
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        print(f"[✅] Successfully assembled video: {output_path}")
 
-        # Verify output file was created
+        # Verify output
         if not os.path.exists(output_path):
             raise RuntimeError("FFmpeg completed but output file was not created")
         if os.path.getsize(output_path) == 0:
             raise RuntimeError("Output video file is empty")
 
+        print(f"[✅] Successfully assembled video: {output_path}")
+        print(f"Video size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
+
+        return True
+
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Video assembly timed out after 60 seconds")
+        raise RuntimeError("Video assembly timed out after 120 seconds")
     except subprocess.CalledProcessError as e:
-        error_msg = f"FFmpeg failed with code {e.returncode}\n"
-        error_msg += f"Command: {' '.join(cmd)}\n"
-        error_msg += f"Error output:\n{e.stderr}"
+        error_msg = (f"FFmpeg failed with code {e.returncode}\n"
+                     f"Command: {' '.join(cmd)}\n"
+                     f"Error output:\n{e.stderr}")
         raise RuntimeError(error_msg)
     except Exception as e:
         raise RuntimeError(f"Video assembly failed: {str(e)}")
@@ -276,10 +302,11 @@ def process_video(video_path, temp_dir='temp', resolution='720p', codec='h264', 
         fps = extract_frames(video_path, frame_dir)
         enhance_frames(frame_dir, enhanced_dir, use_all_cores)
         assemble_video(enhanced_dir, intermediate_video, fps)
-        finalize_output(intermediate_video, final_output, resolution, codec)
+        finalize_output(intermediate_video, final_output, video_path,resolution, codec,)
 
         print(f"[✅] Final video saved as: {final_output}")
     finally:
+        cleanup_temp_dirs(temp_dir)
         clean_memory()
 
 
