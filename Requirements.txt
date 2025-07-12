@@ -1,0 +1,13 @@
+numpy==1.26.4
+opencv-python==4.8.1.78
+
+# CPU-compatible stable versions
+torch==1.11.0
+torchvision==0.12.0
+torchaudio==0.11.0
+
+# Core RealESRGAN dependencies (exact versions)
+realesrgan==0.3.0
+basicsr==1.4.2
+facexlib==0.2.5
+gfpgan==1.3.8
