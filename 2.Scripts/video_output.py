@@ -1,5 +1,9 @@
 import subprocess
 import shutil
+import os
+import datetime
+import subprocess
+from pathlib import Path
 
 # Find FFmpeg in system PATH
 FFMPEG_PATH = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
@@ -23,10 +27,38 @@ def get_audio_codec(input_path):
 
 
 def finalize_output(input_path, output_path, originalFile, resolution='720p', codec='h264'):
+    """Finalize video output with enhanced naming and organization while preserving original functionality.
+
+    Args:
+        input_path: Path to intermediate video file
+        output_path: Desired output path (without extension)
+        originalFile: Path to original source video
+        resolution: Output resolution ('720p', '1080p', '4k')
+        codec: Output codec ('h264', 'h265', 'prores')
+
+    Returns:
+        str: Path to the finalized video file
+
+    Raises:
+        ValueError: For invalid resolution/codec
+        RuntimeError: If FFmpeg processing fails
+    """
     # Convert paths to Linux format
     input_path = input_path.replace('\\', '/')
-    output_path = output_path.replace('\\', '/')
+    originalFile = originalFile.replace('\\', '/')
 
+    # Create organized output directory
+    output_dir = os.path.join(os.path.dirname(originalFile), "TopazLite_Outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Generate distinctive output filename
+    original_name = os.path.splitext(os.path.basename(originalFile))[0]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_ext = '.mov' if codec == 'prores' else '.mp4'
+    final_output = f"endResult_{original_name}_{resolution}_{codec}_{timestamp}{output_ext}"
+    output_path = os.path.join(output_dir, final_output)
+
+    # Video scaling and filters
     scale_filter = {
         '720p': "scale='trunc(oh*a/2)*2:720':flags=lanczos",
         '1080p': "scale='trunc(oh*a/2)*2:1080':flags=lanczos",
@@ -39,6 +71,7 @@ def finalize_output(input_path, output_path, originalFile, resolution='720p', co
 
     vf = f"{scale_filter[resolution]},{unsharp_filter}"
 
+    # Codec configuration (preserving original settings)
     if codec == 'h264':
         codec_args = ['-c:v', 'libx264', '-crf', '18']
     elif codec == 'h265':
@@ -48,15 +81,16 @@ def finalize_output(input_path, output_path, originalFile, resolution='720p', co
     else:
         raise ValueError("Unsupported codec. Choose 'h264', 'h265', or 'prores'.")
 
+    # Audio handling
     audio_codec = get_audio_codec(originalFile)
 
-    # Build base command
+    # Build FFmpeg command (preserving original structure)
     cmd = [
         FFMPEG_PATH, '-y',
         '-i', input_path,
         '-i', originalFile,
-        '-map', '0:v',  # Video from first input
-        '-map', '1:a',  # Audio from original file
+        '-map', '0:v',
+        '-map', '1:a',
         '-vf', vf,
         *codec_args,
         '-c:a', audio_codec,
@@ -64,20 +98,35 @@ def finalize_output(input_path, output_path, originalFile, resolution='720p', co
         output_path
     ]
 
-    # Add audio bitrate only if we're re-encoding
+    # Add audio bitrate if re-encoding
     if audio_codec == 'aac':
         cmd.extend(['-b:a', '192k'])
 
+    # Execute with enhanced error handling
     try:
+        print(f"[ℹ️] Finalizing output to: {output_path}")
         subprocess.run(cmd, check=True)
-        print(f"[✅] Finalized and saved: {output_path}")
+
+        # Verify output
+        if not os.path.exists(output_path):
+            raise RuntimeError("Output file was not created")
+        if os.path.getsize(output_path) == 0:
+            raise RuntimeError("Output file is empty")
+
+        print(f"[✅] Successfully saved: {output_path}")
+        return output_path
+
     except subprocess.CalledProcessError as e:
-        print(f"[❌] FFmpeg command failed with return code {e.returncode}")
-        print(f"Command: {' '.join(cmd)}")
-        raise e
+        error_msg = [
+            "FFmpeg processing failed!",
+            f"Command: {' '.join(cmd)}",
+            f"Exit code: {e.returncode}",
+            "Error output:",
+            e.stderr.strip()[:500]  # Show first 500 chars of error
+        ]
+        raise RuntimeError('\n'.join(error_msg))
     except Exception as e:
-        print(f"[❌] Error during video processing: {str(e)}")
-        raise e
+        raise RuntimeError(f"Unexpected error: {str(e)}")
 
 
 if __name__ == "__main__":
