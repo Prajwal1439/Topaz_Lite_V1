@@ -10,7 +10,8 @@ from functools import partial
 from tqdm import tqdm
 from upscale_frame import upscale_image
 from video_output import finalize_output
-
+import datetime
+from pathlib import Path
 # Global variables for shared resources
 global_upsampler = None
 
@@ -218,97 +219,185 @@ def enhance_frames(frame_dir, enhanced_dir, use_all_cores=True):
         raise
 
 
-def assemble_video(enhanced_dir, output_path, fps):
-    """
-    Assemble enhanced frames into a video (without audio) with thorough error checking.
-    The audio will be added later during finalize_output().
-    """
-    # Verify enhanced_dir exists and contains frames
-    if not os.path.exists(enhanced_dir):
-        raise FileNotFoundError(f"Enhanced frames directory not found: {enhanced_dir}")
+def assemble_video(enhanced_dir, output_path, fps, codec='h264'):
+    """Assemble enhanced frames into a video with specified codec
 
-    frame_files = sorted(
-        [f for f in os.listdir(enhanced_dir)
-         if f.lower().endswith('.png') and os.path.isfile(os.path.join(enhanced_dir, f))]
-    )
+    Args:
+        enhanced_dir: Directory containing enhanced PNG frames
+        output_path: Desired output path (without extension)
+        fps: Frame rate for output video
+        codec: Video codec to use ('h264', 'h265', or 'prores')
+
+    Returns:
+        str: Path to the created video file
+
+    Raises:
+        RuntimeError: For any critical failure with detailed message
+    """
+    # 1. System Requirements Check
+    if not shutil.which('ffmpeg'):
+        raise RuntimeError("FFmpeg not found. Install with: sudo apt install ffmpeg")
+
+    # 2. Input Validation
+    if not os.path.exists(enhanced_dir):
+        raise RuntimeError(f"Directory not found: {enhanced_dir}")
+
+    try:
+        frame_files = sorted(
+            [f for f in os.listdir(enhanced_dir)
+             if f.lower().endswith('.png') and os.path.isfile(os.path.join(enhanced_dir, f))],
+            key=lambda x: int(''.join(filter(str.isdigit, x)))
+        )
+    except ValueError:
+        raise RuntimeError("Frame files must be numerically numbered (e.g., frame_0001.png)")
 
     if not frame_files:
-        raise ValueError(f"No valid PNG frames found in: {enhanced_dir}")
+        raise RuntimeError(f"No PNG frames found in: {enhanced_dir}")
 
-    # Verify at least the first frame exists
-    first_frame = os.path.join(enhanced_dir, frame_files[0])
-    if not os.path.exists(first_frame):
-        raise FileNotFoundError(f"First frame not found: {first_frame}")
+    # 3. Codec Configuration
+    codec_config = {
+        'h264': {
+            'args': ['-c:v', 'libx264', '-crf', '18', '-preset', 'slow', '-pix_fmt', 'yuv420p'],
+            'ext': '.mp4'
+        },
+        'h265': {
+            'args': [
+                '-c:v', 'libx265',
+                '-crf', '20',
+                '-preset', 'slow',
+                '-x265-params', 'log-level=error:no-info=1',
+                '-pix_fmt', 'yuv420p10le'
+            ],
+            'ext': '.mp4'
+        },
+        'prores': {
+            'args': [
+                '-c:v', 'prores_ks',
+                '-profile:v', '3',
+                '-qscale:v', '9',
+                '-vendor', 'apl0',
+                '-pix_fmt', 'yuv422p10le'
+            ],
+            'ext': '.mov'
+        }
+    }
 
-    # Prepare FFmpeg command - explicitly no audio (-an)
+    if codec not in codec_config:
+        raise RuntimeError(f"Unsupported codec: {codec}. Choose: {list(codec_config.keys())}")
+
+    config = codec_config[codec]
+    output_path = os.path.splitext(output_path)[0] + config['ext']
+
+    # 4. Resource Checks
+    free_space = shutil.disk_usage(os.path.dirname(output_path)).free
+    if free_space < 2 * 1024 ** 3:  # 2GB minimum
+        raise RuntimeError(f"Insufficient disk space (needs 2GB, has {free_space / 1024 ** 3:.1f}GB)")
+
+    # 5. FFmpeg Command Construction
     cmd = [
         'ffmpeg', '-y',
         '-framerate', str(fps),
         '-i', os.path.join(enhanced_dir, 'frame_%06d.png'),
-        '-c:v', 'libx264',
-        '-pix_fmt', 'yuv420p',
-        '-an',  # Explicitly no audio
-        '-movflags', '+faststart',  # Enable faststart for web streaming
+        *config['args'],
+        '-an',
+        '-movflags', '+faststart',
+        '-hide_banner',
+        '-loglevel', 'error',
         output_path
     ]
 
-    print(f"[🔁] Assembling {len(frame_files)} frames into video at {fps} FPS")
-    print(f"Command: {' '.join(cmd)}")
-    print(f"Output will be saved to: {output_path}")
-
+    # 6. Execution with Comprehensive Error Handling
     try:
-        # Run FFmpeg with error capture
+        print(f"[⏳] Starting {codec} encode for {len(frame_files)} frames")
         result = subprocess.run(
             cmd,
             check=True,
-            timeout=120,  # Increased timeout to 2 minutes
+            timeout=600,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
 
-        # Verify output
         if not os.path.exists(output_path):
-            raise RuntimeError("FFmpeg completed but output file was not created")
+            raise RuntimeError("FFmpeg failed to create output file")
         if os.path.getsize(output_path) == 0:
-            raise RuntimeError("Output video file is empty")
+            raise RuntimeError("Output file is empty (0 bytes)")
 
-        print(f"[✅] Successfully assembled video: {output_path}")
-        print(f"Video size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
-
-        return True
+        print(f"[✅] Success: {output_path} ({os.path.getsize(output_path) / 1024 ** 2:.1f}MB)")
+        return output_path
 
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Video assembly timed out after 120 seconds")
+        raise RuntimeError("Encoding timed out after 10 minutes")
     except subprocess.CalledProcessError as e:
-        error_msg = (f"FFmpeg failed with code {e.returncode}\n"
-                     f"Command: {' '.join(cmd)}\n"
-                     f"Error output:\n{e.stderr}")
-        raise RuntimeError(error_msg)
+        error_msg = [
+            "FFmpeg encoding failed!",
+            f"Command: {' '.join(cmd)}",
+            f"Exit code: {e.returncode}",
+            "Error output:",
+            e.stderr.strip()
+        ]
+        raise RuntimeError('\n'.join(error_msg))
     except Exception as e:
-        raise RuntimeError(f"Video assembly failed: {str(e)}")
+        raise RuntimeError(f"Unexpected error: {str(e)}")
 
 
 def process_video(video_path, temp_dir='temp', resolution='720p', codec='h264', use_all_cores=True):
-    """Main video processing pipeline with cleanup"""
+    """Main video processing pipeline with distinctive output naming.
+
+    Args:
+        video_path: Path to input video file
+        temp_dir: Temporary working directory
+        resolution: Output resolution ('720p', '1080p')
+        codec: Output codec ('h264', 'h265', 'prores')
+        use_all_cores: Whether to use all CPU cores
+
+    Returns:
+        str: Path to the final output video file
+
+    Raises:
+        RuntimeError: If any processing step fails
+    """
+    cleanup_temp_dirs(temp_dir)
+    clean_memory()
+
     try:
-         # Setup directories
+        # Setup directories
         frame_dir = os.path.join(temp_dir, 'frames')
         enhanced_dir = os.path.join(temp_dir, 'enhanced_frames')
-        intermediate_video = os.path.join(temp_dir, 'enhanced_output.mp4')
-        final_output = os.path.splitext(video_path)[0] + f'_final_{resolution}.mp4'
+
+        # Generate distinctive output name
+        original_name = os.path.splitext(os.path.basename(video_path))[0]
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_output = f"endResult_{original_name}_{resolution}_{codec}_{timestamp}"
 
         # Processing pipeline
         fps = extract_frames(video_path, frame_dir)
         enhance_frames(frame_dir, enhanced_dir, use_all_cores)
-        assemble_video(enhanced_dir, intermediate_video, fps)
-        finalize_output(intermediate_video, final_output, video_path,resolution, codec,)
 
-        print(f"[✅] Final video saved as: {final_output}")
+        intermediate_path = assemble_video(
+            enhanced_dir,
+            os.path.join(temp_dir, f"intermediate_{codec}"),
+            fps,
+            codec
+        )
+
+        final_output_path = finalize_output(
+            intermediate_path,
+            final_output,
+            video_path,
+            resolution,
+            codec
+        )
+
+        print(f"[✅] Final output: {os.path.basename(final_output_path)}")
+        print(f"     Saved to: {os.path.dirname(final_output_path)}")
+        return final_output_path
+
+    except Exception as e:
+        raise RuntimeError(f"Video processing failed: {str(e)}")
     finally:
         cleanup_temp_dirs(temp_dir)
         clean_memory()
-
 
 if __name__ == '__main__':
     process_video(
