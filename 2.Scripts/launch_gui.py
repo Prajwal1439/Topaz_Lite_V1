@@ -14,7 +14,8 @@ def launch_gui():
         input_path = input_entry.get()
         resolution = resolution_var.get()
         codec = codec_var.get()
-        core_usage = core_usage_var.get()  # "all" or "all_but_one"
+        core_usage = core_usage_var.get()
+        model_type = model_var.get()
 
         if not input_path or not os.path.exists(input_path):
             messagebox.showerror("Error", "Please select a valid video file.")
@@ -30,6 +31,7 @@ def launch_gui():
                 video_path=input_path,
                 temp_dir=temp_dir,
                 resolution=resolution,
+                model_type=model_type,
                 codec=codec,
                 use_all_cores=use_all_cores
             )
@@ -40,7 +42,7 @@ def launch_gui():
 
     root = tk.Tk()
     root.title("Topaz Lite - CPU Video Upscaler")
-    root.geometry("500x350")  # Increased height for new option
+    root.geometry("1000x700")
     root.resizable(False, False)
 
     tk.Label(root, text="🎞️ Input Video:").pack(pady=5)
@@ -60,6 +62,10 @@ def launch_gui():
     core_usage_var = tk.StringVar(value="all_but_one")
     tk.OptionMenu(root, core_usage_var, "all", "all_but_one").pack()
 
+    tk.Label(root, text="⚙️ Model Type:").pack()
+    model_var = tk.StringVar(value="quality")
+    tk.OptionMenu(root, model_var, "quality", "fast").pack()
+
     tk.Button(root, text="🚀 Start Upscaling", command=start_upscaling, bg="#4CAF50", fg="white").pack(pady=10)
 
     status_label = tk.Label(root, text="", fg="blue")
@@ -67,6 +73,5 @@ def launch_gui():
 
     root.mainloop()
 
-# Run if launched directly
 if __name__ == "__main__":
     launch_gui()
