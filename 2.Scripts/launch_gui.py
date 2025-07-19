@@ -2,7 +2,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
 from PIL import Image, ImageTk
+import threading
+import queue
+import platform
 from main import process_video
+import time
+import glob
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +64,103 @@ tk.Canvas.create_rounded_rectangle = _create_rounded_rectangle  # monkey‑patch
 
 
 # ---------------------------------------------------------------------------
+# Progress Tracking Functions
+# ---------------------------------------------------------------------------
+
+def count_frames_in_video(video_path):
+    """Count total frames in video for progress calculation"""
+    import cv2
+    try:
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return total_frames
+    except:
+        return 0
+
+
+def monitor_frame_progress(frame_dir, total_frames, progress_queue):
+    """Monitor the number of processed frames and update progress with smoothing."""
+    SMOOTHING_FACTOR = 0.2  # Same as in main.py for consistent smoothing
+    smoothed_progress = 0
+    processed_count = 0
+    last_reported = 0  # Ensure monotonic increase
+
+    enhanced_dir = frame_dir.replace('frames', 'enhanced_frames')
+
+    while processed_count < total_frames:
+        try:
+            if not os.path.exists(enhanced_dir):
+                time.sleep(1)
+                continue
+
+            frame_files = sorted(
+                [f for f in os.listdir(enhanced_dir) if f.endswith('.png')],
+                key=lambda x: int(x.split('_')[1].split('.')[0]))
+
+            current_count = len(frame_files)
+
+            if current_count > last_reported:
+                processed_count = current_count
+            last_reported = current_count
+            # Apply exponential smoothing
+            smoothed_progress = (SMOOTHING_FACTOR * current_count) + ((1 - SMOOTHING_FACTOR) * smoothed_progress)
+            progress_percentage = min((smoothed_progress / total_frames) * 100, 100)
+            progress_queue.put(('progress', int(smoothed_progress), total_frames, progress_percentage))
+
+            time.sleep(0.5)  # Check more frequently for smoother updates
+
+        except Exception as e:
+            progress_queue.put(('error', str(e)))
+            break
+
+    progress_queue.put(('complete',))
+
+
+# ---------------------------------------------------------------------------
+# Modified Processing Function
+# ---------------------------------------------------------------------------
+
+def process_video_with_progress(video_path, temp_dir, resolution, codec, use_all_cores, model_type, progress_queue):
+    """Wrapper for process_video that sends progress updates."""
+    try:
+        progress_queue.put(('status', 'Initializing...'))
+
+        # Count total frames first
+        total_frames = count_frames_in_video(video_path)
+        if total_frames > 0:
+            progress_queue.put(('init_progress', total_frames))
+
+        # Start frame monitoring in a separate thread
+        frame_dir = os.path.join(temp_dir, 'frames')
+        if total_frames > 0:
+            monitor_thread = threading.Thread(
+                target=monitor_frame_progress,
+                args=(frame_dir, total_frames, progress_queue),
+                daemon=True
+            )
+            monitor_thread.start()
+
+        progress_queue.put(('status', 'Extracting frames...'))
+
+        # Call the actual processing function
+        result = process_video(
+            video_path=video_path,
+            temp_dir=temp_dir,
+            resolution=resolution,
+            codec=codec,
+            use_all_cores=use_all_cores,
+            model_type=model_type
+        )
+
+        progress_queue.put(('status', 'Assembling final video...'))
+        progress_queue.put(('success', result))
+
+    except Exception as e:
+        progress_queue.put(('error', str(e)))
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -78,6 +180,58 @@ def launch_gui():
             filename = os.path.basename(file_path)
             file_display.config(text=f"📁 {filename}", fg="#1e293b")
 
+    def update_progress():
+        """Check for progress updates from the processing thread."""
+        try:
+            while True:
+                message = progress_queue.get_nowait()
+
+                if message[0] == 'init_progress':
+                    total_frames = message[1]
+                    progress_bar.config(mode='determinate', maximum=total_frames)
+                    progress_label.config(text=f"Processing 0/{total_frames} frames (0%)")
+
+                elif message[0] == 'progress':
+                    processed, total, percentage = message[1], message[2], message[3]
+                    progress_bar.config(value=processed, maximum=total)
+                    progress_label.config(text=f"Processing {processed}/{total} frames ({percentage:.1f}%)")
+
+                elif message[0] == 'status':
+                    status_text = message[1]
+                    status_label.config(text=f"⏳ {status_text}", fg="#2563eb")
+                    if "Assembling" in status_text:
+                        progress_bar.config(mode='indeterminate')
+                        progress_bar.start()
+                        progress_label.config(text="Finalizing video...")
+
+                elif message[0] == 'success':
+                    progress_bar.stop()
+                    progress_bar.pack_forget()
+                    progress_label.pack_forget()
+                    status_label.config(text="✅ Processing complete! Check the output folder.", fg="#16a34a")
+                    start_btn.config(state='normal', text="🚀 Start video upscaling")
+                    return
+
+                elif message[0] == 'error':
+                    error_msg = message[1]
+                    progress_bar.stop()
+                    progress_bar.pack_forget()
+                    progress_label.pack_forget()
+                    messagebox.showerror("❌ Error", f"Processing failed:\n{error_msg}")
+                    status_label.config(text="❌ Processing failed", fg="#dc2626")
+                    start_btn.config(state='normal', text="🚀 Start video upscaling")
+                    return
+
+                elif message[0] == 'complete':
+                    progress_bar.config(mode='indeterminate')
+                    progress_bar.start()
+                    progress_label.config(text="Assembling video...")
+
+        except queue.Empty:
+            pass
+
+        root.after(100, update_progress)
+
     def start_upscaling():
         input_path = input_entry.get()
         resolution = resolution_var.get()
@@ -92,32 +246,67 @@ def launch_gui():
         temp_dir = "temp_gui_output"
         use_all_cores = core_usage == "all"
 
+        # Disable the start button and show progress
+        start_btn.config(state='disabled', text="⏳ Processing...")
+        status_label.config(text="⏳ Starting processing...", fg="#2563eb")
+
+        # Show progress bar and label
+        progress_bar.pack(pady=(10, 5))
+        progress_label.pack(pady=(0, 10))
+        progress_bar.config(mode='indeterminate', value=0)
+        progress_bar.start()
+        progress_label.config(text="Initializing...")
+
+        # Start processing in a separate thread
+        processing_thread = threading.Thread(
+            target=process_video_with_progress,
+            args=(input_path, temp_dir, resolution, codec, use_all_cores, model_type, progress_queue),
+            daemon=True
+        )
+        processing_thread.start()
+
+        # Start progress monitoring
+        update_progress()
+
+    # --------------------------------------------------
+    # SCROLL FUNCTIONALITY - Cross Platform
+    # --------------------------------------------------
+
+    def bind_mousewheel(widget):
+        """Bind mousewheel to widget for cross-platform compatibility"""
+
+        def _on_mousewheel(event):
+            # Cross-platform mouse wheel support
+            if platform.system() == "Windows":
+                delta = int(-1 * (event.delta / 120))
+            elif platform.system() == "Darwin":  # macOS
+                delta = int(-1 * event.delta)
+            else:  # Linux
+                if event.num == 4:
+                    delta = -1
+                elif event.num == 5:
+                    delta = 1
+                else:
+                    delta = 0
+
+            canvas.yview_scroll(delta, "units")
+            return "break"  # Prevent event propagation
+
+        # Bind different events for different platforms
+        if platform.system() == "Linux":
+            widget.bind("<Button-4>", _on_mousewheel, add="+")
+            widget.bind("<Button-5>", _on_mousewheel, add="+")
+        else:
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+
+    def enable_scrolling_for_widget(widget):
+        """Enable scrolling for a widget and all its children"""
+        bind_mousewheel(widget)
         try:
-            status_label.config(text="⏳ Processing… Please wait", fg="#2563eb")
-            progress_bar.pack(pady=(10, 20))
-            progress_bar.start()
-            root.update()
-
-            process_video(
-                video_path=input_path,
-                temp_dir=temp_dir,
-                resolution=resolution,
-                model_type=model_type,
-                codec=codec,
-                use_all_cores=use_all_cores,
-            )
-
-            progress_bar.stop()
-            progress_bar.pack_forget()
-            status_label.config(
-                text="✅ Processing complete! Check the output folder.", fg="#16a34a"
-            )
-
-        except Exception as exc:
-            progress_bar.stop()
-            progress_bar.pack_forget()
-            messagebox.showerror("❌ Error", f"Processing failed:\n{exc}")
-            status_label.config(text="❌ Processing failed", fg="#dc2626")
+            for child in widget.winfo_children():
+                enable_scrolling_for_widget(child)
+        except:
+            pass
 
     # --------------------------------------------------
     # ROOT WINDOW
@@ -133,6 +322,9 @@ def launch_gui():
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     x, y = (sw - 900) // 2, (sh - 850) // 2
     root.geometry(f"900x850+{x}+{y}")
+
+    # Progress queue for thread communication
+    progress_queue = queue.Queue()
 
     # --------------------------------------------------
     # SCROLLABLE FRAME
@@ -151,12 +343,6 @@ def launch_gui():
 
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
-
-    # Make scroll wheel work anywhere
-    def _on_mousewheel(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
     # Ensure canvas resizes with window
     def configure_canvas(event):
@@ -510,19 +696,19 @@ def launch_gui():
     # ------------ Action Card ------------ #
 
     action_canvas = tk.Canvas(
-        main_frame, height=190, bg="#f1f5f9", highlightthickness=0
+        main_frame, height=220, bg="#f1f5f9", highlightthickness=0  # Increased height for progress elements
     )
     action_canvas.pack(fill="x", pady=(25, 20))
 
     # Create the white rounded rectangle background for the action card
     action_canvas.create_rounded_rectangle(
-        0, 0, 820, 190, radius=25, fill="#ffffff", outline="#e2e8f0", width=1
+        0, 0, 820, 220, radius=25, fill="#ffffff", outline="#e2e8f0", width=1
     )
 
     action_inner = tk.Frame(action_canvas, bg="#ffffff")
-    action_canvas.create_window(410, 95, window=action_inner, width=800, height=170)
+    action_canvas.create_window(410, 110, window=action_inner, width=800, height=200)
 
-    # Start button - FIXED VERSION with proper styling
+    # Start button
     start_btn = tk.Button(
         action_inner,
         text="🚀 Start video upscaling",
@@ -533,7 +719,7 @@ def launch_gui():
         activeforeground="#ffffff",
         relief="flat",
         bd=0,
-        highlightthickness=0,  # Remove highlight border
+        highlightthickness=0,
         cursor="hand2",
         padx=40,
         pady=12,
@@ -544,7 +730,7 @@ def launch_gui():
     # Progress bar (hidden initially)
     style.configure(
         "Custom.Horizontal.TProgressbar",
-        thickness=10,
+        thickness=12,
         troughcolor="#f1f5f9",
         bordercolor="#e2e8f0",
         background="#3b82f6",
@@ -555,8 +741,17 @@ def launch_gui():
     progress_bar = ttk.Progressbar(
         action_inner,
         mode="indeterminate",
-        length=420,
+        length=500,
         style="Custom.Horizontal.TProgressbar",
+    )
+
+    # Progress label (for showing frame count)
+    progress_label = tk.Label(
+        action_inner,
+        text="",
+        font=("Segoe UI", 11, "bold"),
+        bg="#ffffff",
+        fg="#3b82f6",
     )
 
     # Status label
@@ -568,6 +763,9 @@ def launch_gui():
         fg="#6b7280",
     )
     status_label.pack(pady=(15, 0))
+
+    # Enable scrolling after all widgets are created
+    root.after(100, lambda: enable_scrolling_for_widget(root))
 
     # --------------------------------------------------
 
