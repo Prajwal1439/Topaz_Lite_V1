@@ -7,10 +7,71 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 import onnxruntime as ort
 
-# Global model instances
-global_upsampler_quality = None
-global_upsampler_fast = None
+# Global model instances with thread-safe initialization
+_global_upsampler_quality = None
+_global_upsampler_fast = None
+_models_lock = multiprocessing.Lock()
 onnx_model_input_size = 128
+
+
+def get_quality_model(model_path=None):
+    """Thread-safe singleton for quality model"""
+    global _global_upsampler_quality
+
+    if _global_upsampler_quality is None:
+        with _models_lock:
+            if _global_upsampler_quality is None:  # Double-check locking
+                if model_path is None:
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    model_path = os.path.join(script_dir, "..", "1.Models", "RealESRGAN_x2plus.pth")
+
+                model = RRDBNet(
+                    num_in_ch=3, num_out_ch=3,
+                    num_feat=64, num_block=23,
+                    num_grow_ch=32, scale=2
+                )
+                _global_upsampler_quality = RealESRGANer(
+                    scale=2,
+                    model_path=model_path,
+                    model=model,
+                    tile=400,
+                    tile_pad=20,
+                    pre_pad=0,
+                    half=False,
+                    device=torch.device('cpu')
+                )
+                print("[ℹ️] Quality model loaded successfully")
+
+    return _global_upsampler_quality
+
+def get_fast_model(model_path=None):
+    """Thread-safe singleton for fast model"""
+    global _global_upsampler_fast, onnx_model_input_size
+
+    if _global_upsampler_fast is None:
+        with _models_lock:
+            if _global_upsampler_fast is None:  # Double-check locking
+                if model_path is None:
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    model_path = os.path.join(script_dir, "..", "1.Models", "Real-ESRGAN-General-x4v3.onnx")
+
+                # ONNX session options
+                sess_options = ort.SessionOptions()
+                num_cores = max(1, multiprocessing.cpu_count())
+                sess_options.intra_op_num_threads = num_cores
+                sess_options.inter_op_num_threads = 2
+                sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+
+                _global_upsampler_fast = ort.InferenceSession(
+                    model_path,
+                    providers=['CPUExecutionProvider'],
+                    sess_options=sess_options
+                )
+                input_shape = _global_upsampler_fast.get_inputs()[0].shape
+                onnx_model_input_size = input_shape[2]
+                print(f"[ℹ️] Fast model loaded with {num_cores} CPU threads")
+
+    return _global_upsampler_fast
 
 def initialize_fast_model(model_path=None):
     """Optimized multi-core ONNX initialization"""
@@ -160,63 +221,37 @@ def process_with_fast_model(img, session, scalingFactor):
         print(f"[❌] Processing error: {str(e)}")
         raise
 
-def upscale_image(input_path, output_path, scalingFactor=2, model_type="quality", model_path=None):
-    """Main function with enhanced error handling"""
-    global global_upsampler_quality, global_upsampler_fast
 
-    # Load image with validation
+def upscale_image(input_path, output_path, scalingFactor=2, model_type="quality", model_path=None):
+    """Main function using singleton models"""
     try:
         img = cv2.imread(input_path, cv2.IMREAD_COLOR) if isinstance(input_path, str) else input_path
         if img is None:
             raise ValueError(f"Failed to load image: {input_path}")
 
-        validate_image(img)
+        # Dynamic scaling logic remains the same
+        h, w = img.shape[:2]
+        min_dim = min(h, w)
+        if min_dim >= 1080:
+            scale = 720 / min_dim
+            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+            scalingFactor = 1.5
+        elif min_dim == 720:
+            scalingFactor = 1.5
 
+        # Get the appropriate model
         if model_type == "quality":
-            global global_upsampler_quality
-            if global_upsampler_quality is None:  # Changed this condition
-                if model_path is None:
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                    model_path = os.path.join(script_dir, "..", "1.Models", "RealESRGAN_x2plus.pth")
-                    if not os.path.exists(model_path):
-                        raise FileNotFoundError(f"Quality model not found at: {model_path}")
-
-                model = RRDBNet(
-                    num_in_ch=3, num_out_ch=3,
-                    num_feat=64, num_block=23,
-                    num_grow_ch=32, scale=2
-                )
-                global_upsampler_quality = RealESRGANer(  # Changed variable name here
-                    scale=2,
-                    model_path=model_path,
-                    model=model,
-                    tile=400,
-                    tile_pad=20,
-                    pre_pad=0,
-                    half=False,
-                    device=torch.device('cpu')
-                )
-
-            # Process image
-            try:
-                with torch.no_grad():
-                    if scalingFactor == 2:
-                        output, _ = global_upsampler_quality.enhance(img, outscale=2)  # Changed variable name here
-                    else:
-                        output, _ = global_upsampler_quality.enhance(img, outscale=1.5)  # Changed variable name here
-
-                cv2.imwrite(output_path, output)
-            except Exception as e:
-                print(f"[❌] Error processing {input_path}: {str(e)}")
-                raise
+            upsampler = get_quality_model(model_path)
+            with torch.no_grad():
+                output, _ = upsampler.enhance(img, outscale=scalingFactor)
         else:
-            if global_upsampler_fast is None:
-                global_upsampler_fast = initialize_fast_model()
-            output = process_with_fast_model(img, global_upsampler_fast, scalingFactor)
-            cv2.imwrite(output_path, output)
+            session = get_fast_model(model_path)
+            output = process_with_fast_model(img, session, scalingFactor)
 
-        print(f"[✅] Successfully processed: {output_path}")
+        cv2.imwrite(output_path, output)
+        print(f"[✅] Processed: {output_path}")
 
     except Exception as e:
-        print(f"[❌] Critical error in upscale_image: {str(e)}")
+        print(f"[❌] Error in upscale_image: {str(e)}")
         raise
